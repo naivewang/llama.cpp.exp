@@ -115,7 +115,8 @@ static __global__ void ggml_cuda_ar_kernel(
         int                         count,
         int *                       arrival_mine,
         int *                       arrival_other,
-        int                         token) {
+        int                         token,
+        int                         sleep_n) {
 
     // Vector unit for the wire type, sized to the arch's widest single-instruction
     // copy (16 B on Volta+).  Each phase-1 iter writes one vector to host memory;
@@ -163,8 +164,13 @@ static __global__ void ggml_cuda_ar_kernel(
 
         while (ggml_cuda_ar_signal_get(other_slot) != token) {
 #ifdef GGML_USE_HIP
-            // Equals ~100ns at 2500 MHz (sleeps for n * [1,64] clock cycles)
-            __builtin_amdgcn_s_sleep(4);
+            // __builtin_amdgcn_s_sleep requires a compile-time constant, so map the
+            // runtime knob (sleep_n, from GGML_CUDA_AR_SLEEP) to allowed units.  Each
+            // unit ~= 100ns at 2500 MHz (sleeps for n * [1,64] clock cycles).
+            if      (sleep_n <= 1) { __builtin_amdgcn_s_sleep(1); }
+            else if (sleep_n == 2) { __builtin_amdgcn_s_sleep(2); }
+            else if (sleep_n <= 4) { __builtin_amdgcn_s_sleep(4); }
+            else                   { __builtin_amdgcn_s_sleep(8); }
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
 #else
@@ -309,6 +315,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
+    int      ar_sleep;       // T1: spin-sleep unit for the chunked kernel handshake (GGML_CUDA_AR_SLEEP; 4 = default)
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -433,6 +440,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // T1: tunable spin-sleep for the chunked kernel's cross-GPU handshake.  Lower =
+    // finer-grained wake (the poll is PCIe-read-bound anyway); 4 is the historical default.
+    p->ar_sleep         = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_SLEEP", 4);
+    if (p->ar_sleep < 0) p->ar_sleep = 0;
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -905,6 +916,15 @@ bool ggml_cuda_ar_allreduce(
             const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
 
+            // T1: scale the grid to the payload (was always GGML_CUDA_AR_KERNEL_BLOCKS=8).
+            // The kernel is grid-stride; for small decode payloads 8 blocks leaves most
+            // threads idle and issues 8 redundant per-block spins + system-fences.  One
+            // 256-thread block fully covers up to 256 wire-vectors with no idle threads.
+            const int ar_evp    = 16 / (int) type_size;               // ELEMS_PER_VEC (wire type)
+            const int ar_cvec   = (int) (chunk_elems / (size_t) ar_evp);
+            const int ar_blocks = (int) std::min<int>(GGML_CUDA_AR_KERNEL_BLOCKS,
+                                                      std::max<int>(1, (ar_cvec + 255) / 256));
+
             for (int i = 0; i < n; ++i) {
                 const int peer = 1 - i;  // valid for n == 2 only
                 ggml_cuda_set_device(p->devices[i]);
@@ -922,7 +942,7 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(ar_blocks), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
                     reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
@@ -930,7 +950,8 @@ bool ggml_cuda_ar_allreduce(
                     static_cast<int>(chunk_elems), \
                     ggml_cuda_ar_arrival_ptr(p, slot, i), \
                     ggml_cuda_ar_arrival_ptr(p, slot, peer), \
-                    token)
+                    token, \
+                    p->ar_sleep)
 
                 if (use_bf16) {
                     GGML_ASSERT(input_type == GGML_TYPE_F32);
