@@ -92,14 +92,17 @@ Front-load the quick, low-risk items (#10 diag, #3 config) to validate the A/B h
 The roofline's "~14% software headroom" is **real but NOT low-hanging**. Every path below
 requires substantial, risky changes (verified against the source):
 
-- **#1 QKV/gateup concat — HIGH RISK (the big one, ~4-5%).** A fused-QKV path ALREADY exists
-  (`build_qkv`: `if (layer.wqkv)`) but only fires when the GGUF ships `attn_qkv.weight`. To enable it
-  for separate-weight models (SmolLM) I'd synthesize the fused weight at load. **Blocker:** the meta
-  backend does a **contiguous row split** (`ggml-backend-meta.cpp` split-state propagation is
-  per-axis, not head-aware). A fused QKV `[Q(0:n)|K(n:2n)|V(2n:3n)]` split at `3n/2` mis-assigns
-  heads (all-Q→GPU0, all-V→GPU1, K split). Needs an **interleaved-by-head layout + rewritten
-  build_qkv views + load-time reordering** → high risk of **silent wrong output**. **Needs a human
-  in the loop to validate generation correctness.** Highest-value item; pursue deliberately.
+- **#1 QKV concat — DONE: `fuse-qkv` GGUF tool (bit-exact; prefill +3.7%, decode neutral).**
+  Built `tools/fuse-qkv` (on `imp/01-qkv-gateup-concat`): rewrites each layer's separate
+  `attn_q/k/v` into one fused `attn_qkv.weight`, so the **existing** fused-QKV graph path fires
+  (1 GEMV instead of 3). The earlier "contiguous-split mis-assigns heads" fear did NOT materialize:
+  the split is on the *output* dim (heads), and a fused `[Q|K|V]` is split contiguously into
+  `[Q,K½]→GPU0 | V,K½→GPU1` — valid (a few K-heads straddle, which is fine for correctness). The
+  tool is **bit-exact** (identical deterministic prime output). Perf (1.7B Q6_K, n=10): **pp512
+  +3.69%** (prefill), **tg128 +0.37%** (decode, flat) — decode-neutral because the memory-bound
+  GEMV reads the same total bytes and graph capture already amortizes launches. FFN gate/up not
+  fused (dense `build_ffn` has no fused path). So a legitimate **prefill** win + reusable tool,
+  **not a decode win**. See `imp01_results.md`.
 - **#2 quant-in-GEMV — NOT VIABLE as framed.** `ggml-cuda.cu:1807`: `use_mul_mat_vec_q` requires
   `src1->type == F32`; pre-quantizing the input to q8_1 routes to the **slower cuBLAS path**
   (`:1872`). The `quantize_q8_1` is backend-inserted per matmul (not a dedupe-able graph node).
@@ -116,7 +119,16 @@ requires substantial, risky changes (verified against the source):
 - **#9 RCCL — dropped** (deprecated).
 
 ### Bottom line
-Software ceiling on 1.7B tensor-split is real (~14%) but the only high-value lever (#1 fused QKV/gateup)
-is a careful, correctness-sensitive change — **not** low-hanging. The safe wins are: **T1** (done, +5.3%),
-**#3 layer-split config** (done, +8.7% for small models), and **hardware** (x16/P2P, ~2× for AR).
-Recommended next (human-in-loop): implement #1 with a fixed-prompt output-equality check.
+**Delivered (measured, same-commit A/B, bit-exact where applicable):**
+- **T1** — AR grid scaling. **done, tg128 +5.27%** (decode), committed `415b19ec7`.
+- **#3** — layer-split config. **done, +8.7% tg128** for small models (AR/X>0.5), committed `e0dc2d564`.
+- **#1** — `fuse-qkv` GGUF tool. **done, bit-exact, pp512 +3.69%** (prefill), decode neutral,
+  committed `3d1a58cb3` (on `imp/01`).
+- **#10** — AR graph-capture diagnostic. done (no quick win); #2/#4/#5/#6 analyzed & deferred/blocked
+  (root causes above).
+
+**The decode story for this workload:** the two real decode levers are **T1** (done) and, for small
+models, **layer-split** (#3). Beyond that it is **hardware** (x16 slot / P2P board, ~2× for AR). The
+roofline's "~14%" included launch-overhead items that, once graph capture is accounted for, are not
+decode wins (fusion is prefill-only). QKV+gateup prefill fusion (with a dense `build_ffn` fused path)
+would add more prefill, but is a separate, higher-risk change.
