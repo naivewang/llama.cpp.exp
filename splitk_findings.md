@@ -72,3 +72,55 @@ cd /home/elvinw/llama/llama.cpp.exp
 ./build-hip/bin/test-backend-ops perf --meta-devices ROCm0,ROCm1 \
   --tp-gemm Q8_0:5120:5120:1 -o MUL_MAT -p mirror   # 38 us (valid)
 ```
+
+---
+
+## UPDATE (fix attempt): the work is on **no** host-drainable stream
+
+I tried the obvious fix — make the meta backend's `synchronize` also drain the
+AllReduce's own per-device non-blocking streams (`allreduce.cu` `p->streams[i]`),
+which the backends' `synchronize` (`cudaStreamSynchronize(cuda_ctx->stream())`)
+never touches:
+
+- Added `ggml_cuda_ar_pipeline_sync()` (allreduce.cu) draining `p->streams[i]`.
+- Added a new optional comm API `ggml_backend_comm_synchronize` (ggml-backend.h,
+  implemented by the CUDA backend, called from `ggml_backend_meta_synchronize`).
+
+**Result: splitK perf unchanged (3.84 µs), sync still 0–1 µs.** So the
+unaccounted GEMM work is **not** on the AR stream either.
+
+I then went one step further and pointed the CUDA backend's `synchronize` at
+`cudaDeviceSynchronize()` (drains **every** stream on the device) via a
+temporary `GGML_CUDA_DEVICE_SYNC` env gate (reverted after the test):
+
+| sync scope | splitK perf | sync time |
+|------------|-------------|-----------|
+| `cudaStreamSynchronize(compute)` (default) | 3.84 µs | 0–1 µs |
+| + AR-stream sync (`ggml_cuda_ar_pipeline_sync`) | 3.84 µs | 0–1 µs |
+| `cudaDeviceSynchronize()` (ALL streams) | **3.85 µs** | 0–1 µs |
+
+`cudaDeviceSynchronize` drains *all* streams, yet the splitK time does **not
+jump**. The only consistent explanation: **in this microbench's steady state the
+splitK's GEMM kernel is not being issued per timed iteration** — it is being
+elided/no-op'd, not merely left on an async stream. So this is **not** a "sync
+misses a stream" bug that widening the sync can fix.
+
+### What this means
+- The AR-stream sync (kept, committed) is still **correct hygiene** — the meta
+  backend's `synchronize` genuinely did not cover the AR streams before, and
+  real inference *does* have in-flight AR work on them. It is just not the
+  fix for the microbench's degenerate splitK number.
+- The microbench's splitK 3.84 µs is still **invalid** and the cause is that the
+  GEMM is being elided in steady state — most plausibly a **CUDA-graph capture
+  interaction specific to the 2-subgraph + AllReduce shape** (the capture path
+  is what makes the dispatch return before the GEMM is re-issued), or the
+  microbench's whole-ctx-static-buffer allocation interacting with the
+  PARTIAL/AllReduce dispatch. Needs a focused look at
+  `ggml_backend_cuda_graph_compute` + the meta backend's per-subgraph dispatch
+  for the splitK shape specifically.
+
+### Status of the fix attempt
+- **AR-stream sync: KEPT** (correct, low-risk, benefits real inference).
+- **splitK microbench: STILL INVALID** (GEMM elided in steady state; not
+  stream-drainable). The degenerate 3.84 µs number remains unusable until the
+  elision is root-caused in the capture/dispatch path.

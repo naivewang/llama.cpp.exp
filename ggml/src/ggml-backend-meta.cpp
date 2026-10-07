@@ -1815,6 +1815,7 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_synchronize_t      comm_synchronize = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1846,6 +1847,12 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            // Optional: the comm context may expose a synchronize that drains
+            // its own communication streams (e.g. the internal AllReduce's
+            // per-device streams), which the backends' synchronize does not cover.
+            comm_synchronize = (ggml_backend_comm_synchronize_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_synchronize");
         }
     }
 
@@ -1969,6 +1976,15 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+    }
+    // Also drain the comm context's own communication streams (e.g. the internal
+    // AllReduce's per-device non-blocking streams). The backends' synchronize
+    // above only covers each device's compute stream, so without this the device
+    // is not quiesced after an AllReduce and the perf timing returns before the
+    // AllReduce (and its dependent compute) has completed.
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
+    if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_synchronize != nullptr) {
+        backend_ctx->comm_synchronize(backend_ctx->comm_ctx);
     }
 }
 

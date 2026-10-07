@@ -1254,6 +1254,16 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+static void ggml_backend_cuda_comm_synchronize(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    // Drain the internal AllReduce's per-device streams (the backends' own
+    // synchronize only covers the compute stream).
+    ggml_cuda_ar_pipeline_sync(comm_ctx->ar_pipeline);
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -5891,6 +5901,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_synchronize") == 0) {
+        return (void *)ggml_backend_cuda_comm_synchronize;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

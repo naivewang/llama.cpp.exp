@@ -596,6 +596,22 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     delete p;
 }
 
+// Drain all in-flight AllReduce work (the per-device non-blocking AR streams).
+// The compute-stream synchronize in ggml_backend_cuda_synchronize does NOT cover
+// these streams, so callers that need a fully quiescent device (e.g. the meta
+// backend's synchronize, used by the test harness perf path) must also call this.
+void ggml_cuda_ar_pipeline_sync(ggml_cuda_ar_pipeline * p) {
+    if (!p) {
+        return;
+    }
+    for (int i = 0; i < p->n_devices; ++i) {
+        if (p->streams[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
