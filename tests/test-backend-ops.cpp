@@ -51,6 +51,77 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// ---------------------------------------------------------------------------
+// Multi-device ("meta" backend) support
+//
+// With --meta-devices, a test case runs on a ggml_backend_meta_device that
+// shards statically allocated tensors across the selected devices (tensor
+// parallelism). The meta backend queries how each static tensor is split via
+// a callback (test_meta_get_split_state), which forwards to the current test
+// case; compute tensors derive their shard layout from their sources.
+// ---------------------------------------------------------------------------
+struct test_case; // forward declaration
+
+static test_case * g_meta_split_case = nullptr;
+static int         g_meta_n_devs     = 1;
+
+// --tp-gemm: configurable tensor-parallel GEMM microbenchmark.
+// Only meaningful with --meta-devices (tensor parallelism needs >1 device).
+// The GEMM is  C(m,n) = A(k,m) * B(k,n)  where A is the (quantized) weight and
+// B the (float) input; n is the batch / "input size". splitK shards A,B along k
+// and AllReduces the (m,n) partial result; splitN shards A along m (no AllReduce);
+// mirror replicates everything (TP-off baseline). --tp-gemm sets the weight type,
+// k, m and the list of batch sizes to sweep; without it the common defaults below
+// apply (a Q8_0 5120x5120 weight, batches 1,8,32,128,512).
+static bool              g_meta_requested  = false;
+static bool              g_tp_gemm_enabled = false;
+static ggml_type         g_tp_gemm_type    = GGML_TYPE_Q8_0;
+static int64_t           g_tp_gemm_k       = 5120;   // input features / reduction dim
+static int64_t           g_tp_gemm_m       = 5120;   // output features
+static std::vector<int64_t> g_tp_gemm_batches = {1, 8, 32, 128, 512}; // input (batch) sizes
+
+// Map a common weight-type name to its ggml_type (no <regex> -> safe under GCC).
+static bool tp_gemm_type_from_str(const char * name, ggml_type & out) {
+    static const std::pair<const char *, ggml_type> table[] = {
+        {"Q2_K", GGML_TYPE_Q2_K}, {"Q3_K", GGML_TYPE_Q3_K},
+        {"Q4_0", GGML_TYPE_Q4_0}, {"Q4_1", GGML_TYPE_Q4_1},
+        {"Q4_K", GGML_TYPE_Q4_K}, {"Q5_0", GGML_TYPE_Q5_0},
+        {"Q5_K", GGML_TYPE_Q5_K}, {"Q6_K", GGML_TYPE_Q6_K},
+        {"Q8_0", GGML_TYPE_Q8_0}, {"Q8_1", GGML_TYPE_Q8_1},
+        {"Q8_K", GGML_TYPE_Q8_K},
+        {"F16",  GGML_TYPE_F16},  {"BF16", GGML_TYPE_BF16}, {"F32", GGML_TYPE_F32},
+    };
+    for (const auto & kv : table) {
+        if (strcmp(name, kv.first) == 0) { out = kv.second; return true; }
+    }
+    return false;
+}
+
+static ggml_backend_meta_split_state test_meta_split_state_mirrored() {
+    ggml_backend_meta_split_state s;
+    memset(&s, 0, sizeof(s));
+    s.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    s.nr[0]      = 1;
+    s.n_segments = 1;
+    return s;
+}
+
+// Even split of t->ne[axis] across all meta devices.
+// Requires t->ne[axis] to be divisible by g_meta_n_devs (and by the quantization
+// block size when splitting a quantized tensor along axis 0).
+static ggml_backend_meta_split_state test_meta_split_state_even(const ggml_tensor * t, int axis) {
+    ggml_backend_meta_split_state s = test_meta_split_state_mirrored();
+    s.axis = (ggml_backend_meta_split_axis) axis;
+
+    const int64_t granularity = (axis == 0 && ggml_is_quantized(t->type)) ? ggml_blck_size(t->type) : 1;
+    const int64_t ne          = t->ne[axis];
+    GGML_ASSERT(g_meta_n_devs >= 1 && ne % (g_meta_n_devs * granularity) == 0);
+    for (int j = 0; j < g_meta_n_devs; j++) {
+        s.ne[j] = ne / g_meta_n_devs;
+    }
+    return s;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -478,6 +549,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        // meta devices do not belong to a backend reg
+        return false;
+    }
 
     auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
     if (!get_features) {
@@ -1194,6 +1269,28 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
     return std::regex_search(op_name.data(), op_name.data() + op_name.size(), re);
 }
 
+// Result of test_alloc_ctx. buf_a always holds the primary allocation;
+// buf_b is only used by the meta backend (see below).
+struct test_alloc_result {
+    ggml_backend_buffer_ptr buf_a;
+    ggml_backend_buffer_ptr buf_b;
+};
+
+// Allocate the tensors of ctx on backend.
+//
+// For meta backends this uses the standard whole-ctx allocation
+// (ggml_backend_alloc_ctx_tensors), which routes to the meta backend's own
+// allocator. That allocator places every tensor into a single meta buffer
+// whose default usage is ANY, so the device's split-state callback is
+// consulted for ALL non-view tensors (weights, inputs and compute outputs).
+// The callback (test_meta_get_split_state) forwards to the current test case,
+// which returns MIRRORED for every tensor by default (a safe no-TP baseline:
+// each device redundantly computes the full graph) and a real shard layout
+// for the tensor-parallelism cases.
+static test_alloc_result test_alloc_ctx(ggml_backend_t backend, ggml_context * ctx) {
+    return test_alloc_result { ggml_backend_buffer_ptr(ggml_backend_alloc_ctx_tensors(ctx, backend)), nullptr };
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1216,7 +1313,11 @@ struct test_case {
     }
 
     virtual double max_nmse_err(ggml_backend_t backend) {
+        // A meta (tensor-parallel) device does not belong to a backend reg.
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (reg == nullptr) {
+            return max_nmse_err();
+        }
         // See https://github.com/ggml-org/llama.cpp/pull/22976 for explanation.
         if (contains_f16 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
             return std::max(max_nmse_err(), 1e-6);
@@ -1292,6 +1393,17 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+
+    // Split policy for tensors when running on a meta (multi-device) backend.
+    // With the whole-ctx meta allocation the callback is consulted for every
+    // non-view tensor in the graph (weights, inputs and compute outputs), so
+    // overrides must handle all of them. The default policy replicates
+    // (mirrors) every tensor on all devices: each device redundantly computes
+    // the full graph and no AllReduce is needed.
+    virtual ggml_backend_meta_split_state get_split_state(const ggml_tensor * t) {
+        GGML_UNUSED(t);
+        return test_meta_split_state_mirrored();
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1443,30 +1555,44 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
-        ggml_backend_buffer_ptr buf_weights(nullptr);
-        if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
-            if (buf_weights == NULL) {
-                printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
-                return test_status_t::FAIL;
-            }
-            ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        }
+        // On a meta backend the split state of static tensors is queried from
+        // the test case during allocation, so select the policy first.
+        g_meta_split_case = this;
 
-        // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
-
-        if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
-            return test_status_t::FAIL;
-        }
-
-        // build graph
+        // Build the graph BEFORE allocation: the meta backend copies
+        // GGML_TENSOR_FLAG_COMPUTE from each tensor into its per-device simple
+        // tensors at allocation time, so the compute flag (set by
+        // ggml_build_forward_expand) must already be present or the kernels are
+        // silently skipped and outputs stay zero.
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
             ggml_graph_add_node(gf, sentinel);
+        }
+
+        test_alloc_result walloc = { nullptr, nullptr };
+        if (ctx_weights) {
+            walloc = test_alloc_ctx(backend1, ctx_weights.get());
+            if (walloc.buf_a == nullptr) {
+                printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+            ggml_backend_buffer_set_usage(walloc.buf_a.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        // allocate
+        test_alloc_result alloc = test_alloc_ctx(backend1, ctx.get());
+        ggml_backend_buffer_ptr buf(std::move(alloc.buf_a));
+        ggml_backend_buffer_ptr buf2(std::move(alloc.buf_b));
+        ggml_backend_buffer_ptr buf_weights(std::move(walloc.buf_a));
+        ggml_backend_buffer_ptr buf_weights2(std::move(walloc.buf_b));
+        GGML_UNUSED(buf2);
+        GGML_UNUSED(buf_weights2);
+
+        if (buf == NULL) {
+            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+            return test_status_t::FAIL;
         }
 
         // randomize tensors
@@ -1494,6 +1620,14 @@ struct test_case {
             callback_userdata * ud = (callback_userdata *) user_data;
             const char * bn1 = ggml_backend_name(ud->backend1);
             const char * bn2 = ggml_backend_name(ud->backend2);
+
+            // The meta backend is async: graph_compute only enqueues work on the
+            // device streams and returns immediately. Readbacks are unordered
+            // with that work, so drain before comparing (llama.cpp syncs before
+            // it consumes results).
+            if (ggml_backend_dev_type(ggml_backend_get_device(ud->backend1)) == GGML_BACKEND_DEVICE_TYPE_META) {
+                ggml_backend_synchronize(ud->backend1);
+            }
 
             if (t1->op == GGML_OP_NONE) {
                 // sentinels must be unchanged
@@ -1603,18 +1737,36 @@ struct test_case {
             return true;
         }
 
-        ggml_backend_buffer_ptr buf_weights(nullptr);
+        // On a meta backend the split state of static tensors is queried from
+        // the test case during allocation, so select the policy first.
+        g_meta_split_case = this;
+
+        // Build the graph BEFORE allocation (see eval() for why): the meta
+        // backend copies GGML_TENSOR_FLAG_COMPUTE from each tensor into its
+        // per-device simple tensors at allocation time, so the compute flag
+        // (set by ggml_build_forward_expand) must already be present or the
+        // kernels are silently skipped and outputs stay zero.
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        ggml_build_forward_expand(gf, out);
+
+        test_alloc_result walloc = { nullptr, nullptr };
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
-            if (buf_weights == NULL) {
+            walloc = test_alloc_ctx(backend, ctx_weights.get());
+            if (walloc.buf_a == nullptr) {
                 printf("failed to allocate weight tensors\n");
                 return false;
             }
-            ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_set_usage(walloc.buf_a.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
         // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+        test_alloc_result alloc = test_alloc_ctx(backend, ctx.get()); // smart ptr
+        ggml_backend_buffer_ptr buf(std::move(alloc.buf_a));
+        ggml_backend_buffer_ptr buf2(std::move(alloc.buf_b));
+        ggml_backend_buffer_ptr buf_weights(std::move(walloc.buf_a));
+        ggml_backend_buffer_ptr buf_weights2(std::move(walloc.buf_b));
+        GGML_UNUSED(buf2);
+        GGML_UNUSED(buf_weights2);
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
@@ -1627,10 +1779,6 @@ struct test_case {
             initialize_tensors(ctx_weights.get());
         }
 
-        // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
-        ggml_build_forward_expand(gf, out);
-
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
@@ -1640,7 +1788,14 @@ struct test_case {
 
         // determine number of runs
         int n_runs;
-        bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        bool is_cpu  = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // The meta backend is async by design: subgraph compute and AllReduces are
+        // enqueued on the device streams and not waited for (llama.cpp pipelines
+        // layers and syncs when it needs results). For timing, drain explicitly.
+        bool is_meta = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_META;
+        if (is_meta) {
+            ggml_backend_synchronize(backend);
+        }
         if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
@@ -1691,6 +1846,14 @@ struct test_case {
             if (status != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
                 return false;
+            }
+            if (is_meta) {
+                int64_t t_sync = ggml_time_us();
+                ggml_backend_synchronize(backend);
+                int64_t t_sync2 = ggml_time_us();
+                if (total_runs < 4 * n_runs) {
+                    fprintf(stderr, "[debug] sync took %ld us, n_nodes=%d\n", (long)(t_sync2 - t_sync), ggml_graph_n_nodes(gf));
+                }
             }
             int64_t end_time = ggml_time_us();
 
@@ -2005,6 +2168,20 @@ struct test_case {
         return false;
     }
 };
+
+// Split-state callback registered with the meta device. The whole-ctx meta
+// allocation uses a single buffer with default usage ANY, so the callback is
+// consulted for every non-view tensor in the graph (weights, inputs AND
+// compute outputs). It forwards to the current test case, which returns
+// MIRRORED for every tensor by default (a safe no-TP baseline) and a real
+// shard layout for the tensor-parallelism cases.
+static ggml_backend_meta_split_state test_meta_get_split_state(const ggml_tensor * t, void * ud) {
+    GGML_UNUSED(ud);
+    if (g_meta_split_case != nullptr) {
+        return g_meta_split_case->get_split_state(t);
+    }
+    return test_meta_split_state_mirrored();
+}
 
 
 // ####################################
@@ -5113,6 +5290,106 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// Tensor-parallelism variants of test_mul_mat, for runs with --meta-devices.
+// Tensor-parallel variants of test_mul_mat for the meta backend.
+// C = A * B with A: (k, m), B: (k, n), C: (m, n).
+//   split = 0 (splitK): A and B are split along k (the reduction dim); C is a
+//                       partial sum that the meta backend combines via AllReduce.
+//   split = 1 (splitN): A is split along m (the output features); C is sharded
+//                       along m, no AllReduce (Megatron column-parallel).
+//   split = -1 (mirror): everything replicated; each device computes the full
+//                       GEMM (TP-off baseline with the same shapes).
+struct test_mul_mat_split : public test_mul_mat {
+    const int split;
+
+    test_mul_mat_split(int split, ggml_type type_a, ggml_type type_b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, type_b, m, n, k, /* bs */ {1, 1}, /* nr */ {1, 1}), split(split) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + (split == 0 ? "+splitK" : (split == 1 ? "+splitN" : "+mirror"));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        if (split == 0) {
+            // The meta backend only AllReduces PARTIAL nodes that are followed by
+            // more graph work (the final subgraph is not reduced), and a PARTIAL
+            // tensor can neither be read back nor consumed by a regular op. The
+            // llama.cpp pattern after an AllReduce is a residual add_id
+            // (mirrored + partial + mirrored ids -> mirrored), so append a no-op
+            // add_id that makes the graph end on a mirrored tensor.
+            ggml_tensor * zeros = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], out->ne[2]);
+            ggml_set_name(zeros, "ar_zero");
+            // add_id requires ids to be 2-D with shape [src0->ne[1], src0->ne[2]].
+            // With identity values (ids[j] = j) this is a value no-op (result = out)
+            // that still forces the PARTIAL mul_mat output through an AllReduce.
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, out->ne[1], out->ne[2]);
+            ggml_set_name(ids, "ar_ids");
+            out = ggml_add_id(ctx, zeros, out, ids);
+            ggml_set_name(out, "out_ar"); // distinct from the PARTIAL mul_mat "out"
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "ar_zero") {
+                std::vector<uint8_t> data(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (name == "ar_ids") {
+                // identity ids: ids[j] = j, so add_id(zeros, out, ids) == out
+                const int64_t n_ids = ggml_nelements(t);
+                std::vector<int32_t> data(n_ids);
+                for (int64_t j = 0; j < n_ids; j++) data[j] = (int32_t) j;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_backend_meta_split_state get_split_state(const ggml_tensor * t) override {
+        static ggml_backend_meta_split_state partial = []() {
+            ggml_backend_meta_split_state s;
+            memset(&s, 0, sizeof(s));
+            s.axis       = GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+            s.nr[0]      = 1;
+            s.n_segments = 1;
+            return s;
+        }();
+        const std::string name = ggml_get_name(t);
+        switch (split) {
+            case 0: {
+                // split along the reduction dim: both operands carry a k-slice,
+                // the mul_mat result is a partial sum (combined via AllReduce).
+                if (name == "a" || name == "b") {
+                    return test_meta_split_state_even(t, 0);
+                }
+                if (name == "out" && t->op == GGML_OP_MUL_MAT) {
+                    return partial;
+                }
+                break;
+            }
+            case 1: {
+                // split along the output features: A and C are sharded along m,
+                // B is replicated.
+                if (name == "a") {
+                    return test_meta_split_state_even(t, 1);
+                }
+                if (name == "out" && t->op == GGML_OP_MUL_MAT) {
+                    return test_meta_split_state_even(t, 0);
+                }
+                break;
+            }
+            default: {
+                break; // mirrored: everything replicated
+            }
+        }
+        return test_meta_split_state_mirrored();
     }
 };
 
@@ -10410,6 +10687,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Tensor-parallelism split-GEMM correctness (run with --meta-devices).
+    // Smaller shape than the perf variants so the CPU reference stays fast.
+    // k divisible by 2 * Q8_0 block (32) for splitK, m even for splitN.
+    {
+        const int64_t m = 1024, n = 256, k = 1024;
+        test_cases.emplace_back(new test_mul_mat_split( 0, GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k)); // splitK
+        test_cases.emplace_back(new test_mul_mat_split( 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k)); // splitN
+        test_cases.emplace_back(new test_mul_mat_split(-1, GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k)); // mirror
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -12061,6 +12348,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // tensor-parallelism GEMM microbenchmark (run with --meta-devices, e.g.
+    // "ROCm0,ROCm1" or "Vulkan0,Vulkan1"; configure the shape with --tp-gemm).
+    // The quantized weight A(k,m) is split three ways, B(k,n) is the float input
+    // (n = batch / "input size"), C(m,n) is the output:
+    //   splitK : A,B sharded along the reduction dim k -> the (m,n) partial C is
+    //            combined with an AllReduce. This is the tensor-parallel cost we
+    //            want to measure (GEMM + inter-card reduction).
+    //   splitN : A sharded along m, C sharded along m -> no AllReduce (Megatron
+    //            column-parallel; the no-reduction baseline for the same shape).
+    //   mirror : everything replicated (TP-off baseline, same shapes).
+    // Select with:  -o MUL_MAT -p splitK|splitN|mirror
+    //
+    // --tp-gemm [TYPE:K:M:B1,B2,...] configures the weight type, k, m and the
+    // swept batch sizes; without it a common default is used. The swept batch
+    // varies the AllReduce payload (m*batch) across the latency->bandwidth
+    // crossover (the "nerf point").
+    if (g_meta_requested) {
+        for (int64_t batch : g_tp_gemm_batches) {
+            test_cases.emplace_back(new test_mul_mat_split( 0, g_tp_gemm_type, GGML_TYPE_F32, g_tp_gemm_m, batch, g_tp_gemm_k)); // splitK
+            test_cases.emplace_back(new test_mul_mat_split( 1, g_tp_gemm_type, GGML_TYPE_F32, g_tp_gemm_m, batch, g_tp_gemm_k)); // splitN
+            test_cases.emplace_back(new test_mul_mat_split(-1, g_tp_gemm_type, GGML_TYPE_F32, g_tp_gemm_m, batch, g_tp_gemm_k)); // mirror
+        }
+    }
 
     return test_cases;
 }
@@ -12173,6 +12483,9 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     }
 
     auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return true;  // no backend reg (e.g. a meta device): nothing to force
+    }
 
     auto set_ov   = (set_fa_vec_override_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_tuning_set_fa_vec_override");
     auto clear_ov = (clear_fa_vec_override_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_tuning_clear_fa_vec_override");
@@ -12524,7 +12837,14 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
-    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
+    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("  --meta-devices <d0,d1,..>   run tests on the given devices as a single tensor-parallel\n");
+    printf("                              (meta) device, e.g. --meta-devices ROCm0,ROCm1\n");
+    printf("  --tp-gemm [TYPE:K:M:B...]  configure the TP GEMM microbench (needs --meta-devices):\n");
+    printf("                              quant weight A(K,M) x float input B(K,n), n=batch. TYPE=\n");
+    printf("                              Q4_0/Q5_K/Q6_K/Q8_0/F16/BF16 (def Q8_0), K=reduction (def\n");
+    printf("                              5120), M=out feats (def 5120), B=batch list (def 1,8,32,\n");
+    printf("                              128,512). splitK shards A,B along K and AllReduces (M,n).\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
@@ -12532,6 +12852,8 @@ static void usage(char ** argv) {
     printf("  %s -b MTL0 -o 'DSV4.*'\n", argv[0]);
     printf("  %s -b CUDA0 -o 'ADD(type=f16,ne=[1,1,1,1],nr=[32,1,1,1],nf=1,perm1=0,src_overlap=0)'\n", argv[0]);
     printf("  %s perf -o 'MUL_MAT.*'\n", argv[0]);
+    printf("  %s perf --meta-devices ROCm0,ROCm1 -o MUL_MAT -p splitK\n", argv[0]);
+    printf("  %s perf --meta-devices Vulkan0,Vulkan1 --tp-gemm Q8_0:5120:5120:1,32,128 -o MUL_MAT -p splitK\n", argv[0]);
 }
 
 int main(int argc, char ** argv) {
@@ -12541,6 +12863,7 @@ int main(int argc, char ** argv) {
     const char * backend_filter = nullptr;
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
+    const char * meta_devices_filter = nullptr;
     int parallel_workers = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -12596,6 +12919,38 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--meta-devices") == 0) {
+            if (i + 1 < argc) {
+                meta_devices_filter = argv[++i];
+                g_meta_requested = true;
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--tp-gemm") == 0) {
+            // optional arg: WEIGHT_TYPE:K:M:B1,B2,...  (each field optional; a missing
+            // field keeps its default). e.g. --tp-gemm  Q8_0:5120:5120:1,32,128
+            g_tp_gemm_enabled = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                std::string spec(argv[++i]);
+                std::vector<std::string> f;
+                { std::stringstream ss(spec); std::string tok;
+                  while (std::getline(ss, tok, ':')) f.push_back(tok); }
+                if (f.size() > 0 && !f[0].empty()) {
+                    if (!tp_gemm_type_from_str(f[0].c_str(), g_tp_gemm_type)) {
+                        fprintf(stderr, "--tp-gemm: unknown weight type '%s' (e.g. Q4_0,Q5_K,Q6_K,Q8_0,F16,BF16)\n", f[0].c_str());
+                        return 1;
+                    }
+                }
+                if (f.size() > 1 && !f[1].empty()) g_tp_gemm_k = atoll(f[1].c_str());
+                if (f.size() > 2 && !f[2].empty()) g_tp_gemm_m = atoll(f[2].c_str());
+                if (f.size() > 3 && !f[3].empty()) {
+                    g_tp_gemm_batches.clear();
+                    std::stringstream bs(f[3]); std::string b;
+                    while (std::getline(bs, b, ',')) { if (!b.empty()) g_tp_gemm_batches.push_back(atoll(b.c_str())); }
+                    if (g_tp_gemm_batches.empty()) { fprintf(stderr, "--tp-gemm: empty batch list\n"); return 1; }
+                }
+            }
         } else if (strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
                 parallel_workers = atoi(argv[++i]);
@@ -12613,6 +12968,10 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (g_tp_gemm_enabled && meta_devices_filter == nullptr) {
+        fprintf(stderr, "note: --tp-gemm needs --meta-devices to run the tensor-parallel GEMM cases; none will be generated\n");
+    }
+
     // load and enumerate backends
     ggml_backend_load_all();
 
@@ -12623,6 +12982,57 @@ int main(int argc, char ** argv) {
     }
 
     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
+
+    // --meta-devices: run the selected backends as a single tensor-parallel
+    // ("meta") device, e.g. --meta-devices ROCm0,ROCm1
+    if (meta_devices_filter != nullptr) {
+        std::vector<ggml_backend_dev_t> devs;
+        std::stringstream ss(meta_devices_filter);
+        std::string name;
+        while (std::getline(ss, name, ',')) {
+            if (name.empty()) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+            if (dev == nullptr) {
+                fprintf(stderr, "unknown device: %s\n", name.c_str());
+                return 1;
+            }
+            devs.push_back(dev);
+        }
+        if (devs.size() < 2) {
+            fprintf(stderr, "--meta-devices requires at least 2 devices\n");
+            return 1;
+        }
+        if (mode == MODE_GRAD) {
+            fprintf(stderr, "--meta-devices does not support grad mode\n");
+            return 1;
+        }
+
+        g_meta_n_devs = (int) devs.size();
+        ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), devs.size(), test_meta_get_split_state, nullptr);
+        ggml_backend_ptr backend(ggml_backend_dev_init(meta_dev, NULL));
+        if (backend == nullptr) {
+            fprintf(stderr, "failed to init meta backend\n");
+            return 1;
+        }
+
+        output_printer->print_backend_init(backend_init_info(
+            0, 1, ggml_backend_dev_name(meta_dev), false, "", ggml_backend_dev_description(meta_dev), 0, 0, true));
+
+        // a single worker: parallel workers would re-init the meta device per thread
+        bool ok = test_backend(backend.get(), meta_dev, mode, op_names_filter, params_filter,
+                               output_printer.get(), test_file_path, 1);
+
+        output_printer->print_backend_status(
+            backend_status_info(ggml_backend_name(backend.get()), ok ? test_status_t::OK : test_status_t::FAIL));
+
+        ggml_quantize_free();
+        output_printer->print_footer();
+        output_printer->print_overall_summary(overall_summary_info(ok ? 1 : 0, 1, ok));
+
+        return ok ? 0 : 1;
+    }
 
     size_t n_ok = 0;
 
