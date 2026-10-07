@@ -5346,7 +5346,11 @@ struct test_mul_mat_split : public test_mul_mat {
                 std::vector<int32_t> data(n_ids);
                 for (int64_t j = 0; j < n_ids; j++) data[j] = (int32_t) j;
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
-            } else {
+            } else if (t->op == GGML_OP_NONE) {
+                // Only initialize leaf/input tensors (a, b). Compute nodes (the
+                // mul_mat "out" and the add_id "out_ar") are produced by the graph;
+                // setting them here would hit the meta backend's PARTIAL tensor path
+                // (which is not settable) and abort.
                 init_tensor_uniform(t);
             }
         }
