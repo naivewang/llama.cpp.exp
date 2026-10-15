@@ -210,6 +210,10 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    // Synchronize the comm context (drains any in-flight communication work, e.g.
+    // the internal AllReduce's per-device streams, which the backends' own
+    // synchronize does not cover). Optional: backends may leave it null.
+    typedef void   (*ggml_backend_comm_synchronize_t)(void * comm_ctx);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

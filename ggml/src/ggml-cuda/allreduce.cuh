@@ -17,6 +17,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
 // Release all resources owned by the pipeline.
 void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * pipeline);
 
+// Drain all in-flight AllReduce work on the pipeline's per-device streams.
+// Must be called (in addition to the compute-stream synchronize) to fully
+// quiesce the device after an AllReduce.
+void ggml_cuda_ar_pipeline_sync(ggml_cuda_ar_pipeline * pipeline);
+
 // Execute an in-place AllReduce (sum) across tensors[0..n_devices-1].
 // tensors[i] must live on the device managed by backends[i] and be
 // contiguous F32, F16, or BF16.
