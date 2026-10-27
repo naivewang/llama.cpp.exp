@@ -219,6 +219,11 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+    // Release the context(s) and all process-local state held by the backend on the device,
+    // allowing the GPU to power down fully while the calling process stays alive (e.g. server sleep).
+    // All backends and buffers of the device must be freed before calling; the device can be
+    // re-initialized later.
+    typedef bool                         (*ggml_backend_dev_release_context_t)(ggml_backend_dev_t device);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

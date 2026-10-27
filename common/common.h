@@ -667,6 +667,7 @@ struct common_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+    bool sleep_release_gpu = false; // on sleep, release the GPU context of the used devices so the GPU can power down fully
 
     std::vector<std::string> api_keys;
 

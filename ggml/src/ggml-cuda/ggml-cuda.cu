@@ -6276,6 +6276,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// release the (primary) context and all process-local state of this device, so that the GPU can
+// power down fully (VRAM released, clocks drop) while the calling process keeps running.
+// all backends/buffers of the device must be freed by the caller before invoking this;
+// the context is recreated transparently on next use
+static bool ggml_backend_cuda_dev_release_context(ggml_backend_dev_t device) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) device->context;
+
+    if (const cudaError_t err = cudaSetDevice(ggml_cuda_get_physical_device(ctx->device)); err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: cudaSetDevice(%d) failed: %s\n", __func__, ctx->device, cudaGetErrorString(err));
+        return false;
+    }
+    if (const cudaError_t err = cudaDeviceReset(); err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: cudaDeviceReset() failed: %s\n", __func__, cudaGetErrorString(err));
+        return false;
+    }
+    GGML_LOG_INFO("%s: released " GGML_CUDA_NAME " context of device %d\n", __func__, ctx->device);
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6295,6 +6314,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_release_context") == 0) {
+        return (void *)ggml_backend_cuda_dev_release_context;
     }
     return nullptr;
 }

@@ -3866,6 +3866,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--sleep-release-gpu"},
+        "when the server enters sleeping state, release the GPU context of the used devices so the GPU can power down fully (requires --sleep-idle-seconds)",
+        [](common_params & params) {
+            params.sleep_release_gpu = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

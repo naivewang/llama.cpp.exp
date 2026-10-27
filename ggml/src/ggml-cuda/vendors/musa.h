@@ -89,6 +89,7 @@
 #define cudaMemGetInfo musaMemGetInfo
 #define cudaOccupancyMaxPotentialBlockSize musaOccupancyMaxPotentialBlockSize
 #define cudaSetDevice musaSetDevice
+#define cudaDeviceReset musaDeviceReset
 #define cudaStreamCreateWithFlags musaStreamCreateWithFlags
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamFireAndForget musaStreamFireAndForget

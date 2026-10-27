@@ -1134,6 +1134,29 @@ private:
         mctx = nullptr;
     }
 
+    // release the process-local GPU context(s) of the used devices so the hardware can power
+    // down fully while the server is sleeping.
+    // note: safe only after destroy(), when this process holds no model/context on those devices
+    //       (additional models of a multi-model server run in separate processes)
+    void release_gpu_contexts() {
+        for (ggml_backend_dev_t dev : params_base.devices) {
+            if (!dev) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (!reg) {
+                continue;
+            }
+            auto release = (ggml_backend_dev_release_context_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_release_context");
+            if (!release) {
+                continue;
+            }
+            if (!release(dev)) {
+                SRV_WRN("sleep: failed to release GPU context of device '%s'\n", ggml_backend_dev_name(dev));
+            }
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1142,7 +1165,19 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            // swap out the live KV of all non-empty slots into the RAM prompt cache
+            // (same prompt_save() path as a normal slot swap) so sessions can be
+            // restored after wake without a full re-prefill
+            if (prompt_cache) {
+                for (server_slot & slot : slots) {
+                    slot.prompt_save(*prompt_cache);
+                }
+                prompt_cache->update();
+            }
             destroy();
+            if (params_base.sleep_release_gpu) {
+                release_gpu_contexts();
+            }
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -1585,9 +1620,15 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // on resume from sleep the model and params are identical, so the RAM prompt cache
+            // (raw state blobs, context-independent) is still valid: keep it instead of
+            // recreating; only the VRAM copy is rebuilt on cache hit
+            if (!(prompt_cache && is_resume)) {
+                prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            prompt_cache.reset();
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
