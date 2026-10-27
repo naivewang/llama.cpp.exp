@@ -6287,6 +6287,7 @@ static bool ggml_backend_cuda_dev_release_context(ggml_backend_dev_t device) {
         GGML_LOG_ERROR("%s: cudaSetDevice(%d) failed: %s\n", __func__, ctx->device, cudaGetErrorString(err));
         return false;
     }
+    GGML_LOG_INFO("%s: cudaDeviceReset() on device %d ...\n", __func__, ctx->device);
     if (const cudaError_t err = cudaDeviceReset(); err != cudaSuccess) {
         GGML_LOG_ERROR("%s: cudaDeviceReset() failed: %s\n", __func__, cudaGetErrorString(err));
         return false;

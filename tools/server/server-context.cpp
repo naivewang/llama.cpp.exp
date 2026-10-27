@@ -1139,7 +1139,20 @@ private:
     // note: safe only after destroy(), when this process holds no model/context on those devices
     //       (additional models of a multi-model server run in separate processes)
     void release_gpu_contexts() {
-        for (ggml_backend_dev_t dev : params_base.devices) {
+        std::vector<ggml_backend_dev_t> devs;
+        if (!params_base.devices.empty()) {
+            devs = params_base.devices;
+        } else {
+            // no explicit -dev list (e.g. plain -ngl): release all GPU-type devices of the system
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    devs.push_back(dev);
+                }
+            }
+        }
+        for (ggml_backend_dev_t dev : devs) {
             if (!dev) {
                 continue;
             }
@@ -1169,14 +1182,22 @@ private:
             // (same prompt_save() path as a normal slot swap) so sessions can be
             // restored after wake without a full re-prefill
             if (prompt_cache) {
+                SRV_INF("%s", "sleep: saving slot state to RAM prompt cache\n");
                 for (server_slot & slot : slots) {
                     slot.prompt_save(*prompt_cache);
                 }
                 prompt_cache->update();
             }
-            destroy();
+            {
+                const int64_t t0 = ggml_time_ms();
+                destroy();
+                SRV_INF("sleep: destroyed model/contexts in %.1f s\n", (ggml_time_ms() - t0) / 1000.0);
+            }
             if (params_base.sleep_release_gpu) {
+                SRV_INF("%s", "sleep: releasing GPU contexts (may take a moment)\n");
+                const int64_t t0 = ggml_time_ms();
                 release_gpu_contexts();
+                SRV_INF("sleep: GPU context release done in %.1f s\n", (ggml_time_ms() - t0) / 1000.0);
             }
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
