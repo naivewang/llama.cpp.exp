@@ -57,12 +57,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -1013,14 +1016,218 @@ static int run_server_mode(int argc, char ** argv) {
     return (ok && same) ? 0 : 1;
 }
 
-int main(int argc, char ** argv) {
-    bool worker_mode = false, server_mode = false;
+// ---------------------------------------------------------------------------
+// service mode: a long-lived carrier running a real llama-server service
+//
+//   llama-gpu-worker --service --port 8080 [--sleep-idle-seconds 180] \
+//                    [--server-bin PATH] [llama-server args ...]
+//
+//   The carrier owns the public port; the llama-server child runs on an
+//   ephemeral 127.0.0.1 port and every client connection is byte-relayed.
+//   After --sleep-idle-seconds without a live connection:
+//     1. DUMP: the prompt cache (KV) is pulled into the carrier's RAM
+//     2. SHUTDOWN over the kv channel: the server releases the GPU itself
+//        and exits 0  ->  no llama-server in rocm-smi, VRAM ~0, no fds
+//   The next connection respawns the server with RESTORE(blob): the
+//   conversation continues without re-prefill. /health while asleep answers
+//   200 directly - a probe must not pay the model reload.
+// ---------------------------------------------------------------------------
+
+static uint64_t now_ms_svc() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void pump_fd(int from, int to) {
+    char buf[65536];
+    for (;;) {
+        const ssize_t n = ::recv(from, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        if (!kvsock::send_all(to, reinterpret_cast<const uint8_t *>(buf), (size_t) n)) break;
+    }
+}
+
+static int run_service_mode(int argc, char ** argv) {
+    int port = 8080, idle_s = 180;
+    std::string server_bin;
+    std::vector<std::string> srv_args;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
-        if (a == "--worker") { worker_mode = true; break; }
-        if (a == "--server") { server_mode = true; break; }
+        if (a == "--service")               { /* mode flag */ }
+        else if (a == "--port")             { port = atoi(argv[++i]); }
+        else if (a == "--sleep-idle-seconds") { idle_s = atoi(argv[++i]); }
+        else if (a == "--server-bin")       { server_bin = argv[++i]; }
+        else if (a == "--host")             { i++; /* the carrier owns the bind address */ }
+        else if (a == "--sleep-release-gpu") { /* the carrier owns the sleep lifecycle */ }
+        else                                { srv_args.push_back(a); }
+    }
+    if (srv_args.empty()) { fprintf(stderr, "service: no server args (e.g. -m MODEL -ngl 99)\n"); return 1; }
+    if (server_bin.empty()) {
+        char exe[4096];
+        const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0 && strstr(exe, "llama-gpu-worker")) {
+            exe[n] = 0;
+            server_bin = std::string(exe, strlen(exe) - strlen("llama-gpu-worker")) + "llama-server";
+        }
+    }
+    if (server_bin.empty()) { fprintf(stderr, "service: no server binary (use --server-bin PATH)\n"); return 1; }
+
+    // ---- listener on the public port
+    const int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { perror("service: socket"); return 1; }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t) port);
+    if (bind(lfd, (sockaddr *) &addr, sizeof(addr)) != 0) { perror("service: bind"); return 1; }
+    if (listen(lfd, 32) != 0) { perror("service: listen"); return 1; }
+    std::printf("service carrier pid=%d: listening on :%d, server: %s (%zu args), sleep after %d s idle\n",
+                (int) getpid(), port, server_bin.c_str(), srv_args.size(), idle_s);
+    std::fflush(stdout);
+
+    std::mutex mtx; // serializes wake/sleep transitions
+    server_child sc;
+    std::vector<uint8_t> blob; // the KV lives in the carrier's RAM, nowhere else
+    std::atomic<bool> running { true };
+    std::atomic<long> active { 0 };
+    std::atomic<uint64_t> last_activity { now_ms_svc() };
+
+    // signal handlers only set a flag; the loops poll it
+    static std::atomic<bool> running_sig { false };
+    auto on_term = [](int) { running_sig = true; };
+    signal(SIGTERM, on_term);
+    signal(SIGINT, on_term);
+
+    // ---- idle reaper: dump the KV, then ask the server to exit
+    std::thread reaper([&] {
+        while (running && !running_sig) {
+            for (int i = 0; i < 50 && !running_sig; i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (running_sig) break;
+            if (active > 0) continue;
+            if (now_ms_svc() - last_activity < (uint64_t) idle_s * 1000ull) continue;
+            std::lock_guard<std::mutex> lk(mtx);
+            if (sc.pid < 0 || active > 0) continue;
+            last_activity = now_ms_svc(); // don't re-fire while dumping/stopping
+            std::vector<uint8_t> b;
+            if (sc.kv_dump(b)) {
+                blob = std::move(b);
+                std::printf("service: KV dumped to carrier RAM (%.2f MiB)\n", blob.size() / 1048576.0);
+            } else {
+                fprintf(stderr, "service: KV dump failed; still shutting the server down\n");
+            }
+            std::fflush(stdout);
+            sc.stop_graceful();
+            std::printf("service: server exited; GPU fully released; sleeping until next request\n");
+            std::fflush(stdout);
+        }
+    });
+
+    // ---- accept loop
+    while (!running_sig) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lfd, &rfds);
+        timeval tv { 200, 0 };
+        const int sr = select(lfd + 1, &rfds, nullptr, nullptr, &tv);
+        if (sr <= 0) continue;
+        const int cfd = accept(lfd, nullptr, nullptr);
+        if (cfd < 0) continue;
+        last_activity = now_ms_svc();
+
+        std::thread([&, cfd] {
+            // buffer the request head; /health while asleep must not wake
+            char hdr[8192];
+            ssize_t hn = 0;
+            bool dead = false;
+            while (hn < (ssize_t) sizeof(hdr) - 1) {
+                const ssize_t n = ::recv(cfd, hdr + hn, sizeof(hdr) - 1 - (size_t) hn, 0);
+                if (n <= 0) { dead = (n <= 0); break; }
+                hn += n;
+                if (memmem(hdr, (size_t) hn, "\r\n\r\n", 4) != nullptr) break;
+            }
+            const bool is_health = hn >= 11 && strncmp(hdr, "GET /health", 11) == 0;
+            if (dead && hn == 0) { ::close(cfd); return; }
+            if (is_health && sc.pid < 0) {
+                const char * ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                  "Content-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+                kvsock::send_all(cfd, (const uint8_t *) ok, strlen(ok));
+                ::close(cfd);
+                return;
+            }
+            // ensure the server is up (wake if asleep)
+            int cport = 0;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (sc.pid < 0) {
+                    cport = pick_free_port();
+                    if (cport < 0) { ::close(cfd); return; }
+                    std::printf("service: wake (KV %s, %.2f MiB) - model load starts now\n",
+                                blob.empty() ? "empty" : "restore", blob.size() / 1048576.0);
+                    std::fflush(stdout);
+                    if (!sc.start(server_bin, srv_args, cport, blob.empty() ? nullptr : &blob) ||
+                        !wait_http_ready(cport, 600)) {
+                        fprintf(stderr, "service: wake failed\n");
+                        ::close(cfd);
+                        return;
+                    }
+                    std::printf("service: server up (pid %d, port %d)\n", (int) sc.pid, cport);
+                    std::fflush(stdout);
+                } else {
+                    cport = sc.port;
+                }
+            }
+            active++;
+            const int sfd = socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in sa {};
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sa.sin_port = htons((uint16_t) cport);
+            if (sfd < 0 || connect(sfd, (sockaddr *) &sa, sizeof(sa)) != 0) {
+                fprintf(stderr, "service: connect to child failed\n");
+                if (sfd >= 0) ::close(sfd);
+                ::close(cfd);
+                active--;
+                last_activity = now_ms_svc();
+                return;
+            }
+            if (hn > 0 && !kvsock::send_all(sfd, (const uint8_t *) hdr, (size_t) hn)) {
+                ::close(sfd); ::close(cfd); active--; last_activity = now_ms_svc();
+                return;
+            }
+            std::thread t1([&] { pump_fd(cfd, sfd); ::shutdown(cfd, SHUT_WR); });
+            std::thread t2([&] { pump_fd(sfd, cfd); ::shutdown(sfd, SHUT_WR); });
+            t1.join(); t2.join();
+            ::close(sfd);
+            ::close(cfd);
+            active--;
+            last_activity = now_ms_svc();
+        }).detach();
+    }
+
+    // ---- carrier shutdown: take the server down with us
+    running = false;
+    reaper.join();
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        sc.stop();
+    }
+    ::close(lfd);
+    std::printf("service carrier exiting\n");
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    bool worker_mode = false, server_mode = false, service_mode = false;
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--worker")  { worker_mode = true; break; }
+        if (a == "--server")  { server_mode = true; break; }
+        if (a == "--service") { service_mode = true; break; }
     }
     if (worker_mode) return run_worker(argc, argv);
     if (server_mode) return run_server_mode(argc, argv);
+    if (service_mode) return run_service_mode(argc, argv);
     return run_client(argc, argv);
 }
