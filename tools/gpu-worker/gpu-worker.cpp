@@ -930,6 +930,9 @@ static int run_server_mode(int argc, char ** argv) {
         }
 
         sc.kill_hard();
+        // the ROCm/CUDA driver reclaims a killed process's VRAM asynchronously;
+        // give it a moment so the snapshot below shows the real (released) state
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
         snapshot("PHASE 2: server dropped (expect: no server pid, VRAM ~0)");
 
