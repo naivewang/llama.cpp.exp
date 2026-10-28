@@ -1137,7 +1137,9 @@ static int run_service_mode(int argc, char ** argv) {
         last_activity = now_ms_svc();
 
         std::thread([&, cfd] {
-            // buffer the request head; /health while asleep must not wake
+            // buffer the request head. While asleep, ONLY inference requests
+            // (POST) wake the server - constant pollers of /metrics, /slots,
+            // /v1/models, /health must not pay the model reload.
             char hdr[8192];
             ssize_t hn = 0;
             bool dead = false;
@@ -1147,14 +1149,41 @@ static int run_service_mode(int argc, char ** argv) {
                 hn += n;
                 if (memmem(hdr, (size_t) hn, "\r\n\r\n", 4) != nullptr) break;
             }
-            const bool is_health = hn >= 11 && strncmp(hdr, "GET /health", 11) == 0;
             if (dead && hn == 0) { ::close(cfd); return; }
-            if (is_health && sc.pid < 0) {
-                const char * ok = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                                  "Content-Length: 15\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
-                kvsock::send_all(cfd, (const uint8_t *) ok, strlen(ok));
-                ::close(cfd);
-                return;
+            if (sc.pid < 0) {
+                // parse "METHOD SP PATH SP HTTP/x" from the buffered head
+                char method[16] = { 0 }, path[1024] = { 0 };
+                if (hn > 0) {
+                    const char * sp1 = (char *) memchr(hdr, ' ', (size_t) hn);
+                    if (sp1 != nullptr) {
+                        const size_t ml = (size_t) (sp1 - hdr);
+                        std::memcpy(method, hdr, ml < sizeof(method) - 1 ? ml : sizeof(method) - 1);
+                        const char * sp2 = (char *) memchr(sp1 + 1, ' ', (size_t) hn - (size_t) (sp1 - hdr) - 1);
+                        const size_t pl = sp2 != nullptr ? (size_t) (sp2 - (sp1 + 1))
+                                                         : (size_t) hn - (size_t) (sp1 - hdr) - 1;
+                        std::memcpy(path, sp1 + 1, pl < sizeof(path) - 1 ? pl : sizeof(path) - 1);
+                    }
+                }
+                const bool is_get = std::strncmp(method, "GET", 3) == 0 ||
+                                    std::strncmp(method, "HEAD", 4) == 0 ||
+                                    std::strncmp(method, "OPTIONS", 7) == 0;
+                if (is_get) {
+                    int code = 503;
+                    const char * ctype = "application/json";
+                    std::string body = "{\"error\":\"service is asleep; POST an inference request to wake it\"}";
+                    if (std::strncmp(path, "/health", 7) == 0)        { code = 200; body = "{\"status\":\"ok\"}"; }
+                    else if (std::strncmp(path, "/metrics", 8) == 0)  { code = 200; ctype = "text/plain; version=0.0.4"; body = ""; }
+                    else if (std::strncmp(path, "/slots", 6) == 0)    { code = 200; body = "{\"slots\":[]}"; }
+                    else if (std::strncmp(path, "/v1/models", 10) == 0 ||
+                             std::strncmp(path, "/models", 7) == 0)   { code = 200; body = "{\"object\":\"list\",\"data\":[]}"; }
+                    const std::string rsp = std::string("HTTP/1.1 ") + (code == 200 ? "200 OK" : "503 Service Unavailable") +
+                                            "\r\nContent-Type: " + ctype + "\r\nContent-Length: " +
+                                            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                    kvsock::send_all(cfd, (const uint8_t *) rsp.data(), rsp.size());
+                    ::close(cfd);
+                    return;
+                }
+                // anything else (POST /v1/completions, /v1/chat/completions, ...): wake
             }
             // ensure the server is up (wake if asleep)
             int cport = 0;
