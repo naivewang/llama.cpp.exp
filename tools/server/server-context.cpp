@@ -10,6 +10,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-kv-socket.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1040,6 +1041,7 @@ public:
     }
 
     ~server_context_impl() {
+        kv_shutdown();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1096,6 +1098,13 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // KV handoff channel to a GPU-free parent (watchdog), see server-kv-socket.h.
+    // The parent holds dumped KV states in its own RAM (no files): deep-sleep =
+    // dump -> parent -> kill this process; wake = new process + restore.
+    int          kv_fd     = -1;   // from --kv-fd; connected socket to the watchdog
+    std::mutex   kv_mutex;         // guards prompt_cache->states vs the kv control thread
+    std::thread  kv_thread;        // kv control channel thread (DUMP/PING)
 
     server_metrics metrics;
 
@@ -1183,6 +1192,7 @@ private:
             // restored after wake without a full re-prefill
             if (prompt_cache) {
                 SRV_INF("%s", "sleep: saving slot state to RAM prompt cache\n");
+                std::lock_guard<std::mutex> lock(kv_mutex);
                 for (server_slot & slot : slots) {
                     slot.prompt_save(*prompt_cache);
                 }
@@ -1677,6 +1687,15 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        // KV handoff channel to a GPU-free parent (watchdog): boot handshake
+        // (RESTORE/SKIP) before serving starts, then a control thread for
+        // runtime DUMP requests. See server-kv-socket.h.
+        if (!is_resume && params.kv_fd >= 0) {
+            kv_fd = params.kv_fd;
+            kv_boot_handshake();
+            kv_thread = std::thread([this] { kv_control_loop(); });
+        }
+
         if (!is_resume) {
             return init();
         }
@@ -1686,6 +1705,113 @@ private:
         }
 
         return true;
+    }
+
+    // close the KV control channel and join its thread (idempotent)
+    void kv_shutdown() {
+        if (kv_fd >= 0) {
+            ::shutdown(kv_fd, SHUT_RDWR);
+            ::close(kv_fd);
+            kv_fd = -1;
+        }
+        if (kv_thread.joinable()) {
+            kv_thread.join();
+        }
+    }
+
+    // boot handshake: READY -> RESTORE/SKIP; the restored states are inserted
+    // into the prompt cache so a matching request gets a full cache hit
+    // (KV restored, no re-prefill) before serving starts
+    void kv_boot_handshake() {
+        if (!kvsock::send_frame(kv_fd, kvsock::KV_OP_READY, nullptr, 0)) {
+            SRV_WRN("%s", "kv: failed to send READY to parent, disabling kv channel\n");
+            kv_fd = -1;
+            return;
+        }
+        uint32_t op = 0;
+        std::vector<uint8_t> payload;
+        if (!kvsock::recv_frame(kv_fd, op, payload, 300000)) {
+            SRV_WRN("%s", "kv: no RESTORE/SKIP from parent in time, continuing without restore\n");
+            return; // keep the channel open for runtime DUMP
+        }
+        if (op == kvsock::KV_OP_SKIP || (op == kvsock::KV_OP_RESTORE && payload.empty())) {
+            SRV_INF("%s", "kv: parent sent SKIP (fresh start)\n");
+            return;
+        }
+        if (op != kvsock::KV_OP_RESTORE) {
+            SRV_WRN("kv: unexpected boot frame op=%u, ignoring\n", op);
+            return;
+        }
+        if (!prompt_cache) {
+            SRV_ERR("%s", "kv: got RESTORE but the prompt cache is disabled (--cache-ram 0?)\n");
+            return;
+        }
+        std::list<server_prompt_cache_state> states;
+        if (!kvsock::deserialize_states(payload.data(), payload.size(), states)) {
+            SRV_ERR("kv: failed to deserialize restored states (%zu bytes)\n", payload.size());
+            return;
+        }
+        size_t n_tokens = 0, n_bytes = 0;
+        for (auto & st : states) {
+            n_tokens += st.prompt.n_tokens();
+            n_bytes  += st.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(kv_mutex);
+            for (auto & st : states) {
+                prompt_cache->states.push_back(std::move(st));
+            }
+        }
+        SRV_INF("kv: restored %zu prompt-cache state(s), %d tokens, %.3f MiB (matching request gets a full cache hit)\n",
+                states.size(), (int) n_tokens, n_bytes / (1024.0*1024.0));
+    }
+
+    // runtime control channel: DUMP (serialize the prompt cache, force-saving
+    // idle slots first - their state is normally only published on the next
+    // task) and PING
+    void kv_control_loop() {
+        for (;;) {
+            uint32_t op = 0;
+            std::vector<uint8_t> payload;
+            if (!kvsock::recv_frame(kv_fd, op, payload, 0)) {
+                break; // parent went away or the channel was closed
+            }
+            switch (op) {
+                case kvsock::KV_OP_DUMP: {
+                    std::vector<uint8_t> out;
+                    {
+                        std::lock_guard<std::mutex> lock(kv_mutex);
+                        if (prompt_cache && !sleeping) {
+                            for (auto & slot : slots) {
+                                if (slot.state == SLOT_STATE_IDLE && slot.ctx_tgt && !slot.prompt.tokens.empty()) {
+                                    slot.prompt_save(*prompt_cache);
+                                }
+                            }
+                            prompt_cache->update();
+                            std::vector<uint8_t> states_data;
+                            kvsock::serialize_states(prompt_cache->states, states_data);
+                            out.resize(4);
+                            uint32_t ok = 1;
+                            std::memcpy(out.data(), &ok, 4);
+                            out.insert(out.end(), states_data.begin(), states_data.end());
+                        } else {
+                            out.resize(4, 0); // ok = 0
+                        }
+                    }
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_DUMP_RSP, out.data(), out.size());
+                    break;
+                }
+                case kvsock::KV_OP_PING: {
+                    uint32_t ok = 1;
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_PONG, (const uint8_t *) &ok, 4);
+                    break;
+                }
+                default:
+                    SRV_WRN("kv: unexpected frame op=%u\n", op);
+                    break;
+            }
+        }
+        SRV_INF("%s", "kv: control channel closed\n");
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1929,13 +2055,17 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                    ret->prompt_save(*prompt_cache);
+
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear();
+                    }
+
+                    prompt_cache->update();
                 }
-
-                prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2709,8 +2839,11 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
-                prompt_cache->update();
+            {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                if (prompt_cache && slot->prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
             }
 
             int id_child = parent_task.child_tasks[idx].id;
@@ -3079,9 +3212,12 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
+                                {
+                                    std::lock_guard<std::mutex> lock(kv_mutex);
+                                    if (slot.prompt_save(*prompt_cache)) {
+                                        SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                        prompt_cache->update();
+                                    }
                                 }
 
                                 if (params_base.kv_unified) {
@@ -5160,6 +5296,7 @@ void server_context::start_loop() {
 }
 
 void server_context::terminate() {
+    impl->kv_shutdown();
     impl->queue_tasks.terminate();
 }
 

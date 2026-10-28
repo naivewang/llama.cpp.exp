@@ -1,29 +1,53 @@
-// llama-gpu-worker: Phase 2 PoC — "sleep = drop the GPU process", llama.cpp edition.
+// llama-gpu-worker: "sleep = drop the GPU process", llama.cpp edition.
 //
-// One binary, two modes:
+// build (repo root; standalone, no CMake target):
+//   g++ -std=c++17 \
+//     -DCPPHTTPLIB_OPENSSL_SUPPORT -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DGGML_USE_HIP -DLLAMA_SHARED \
+//     -Icommon/. -Ivendor/nlohmann/.. -Ivendor/nlohmann -Ivendor/sheredom/.. \
+//     -Isrc/../include -Iggml/src/../include \
+//     -O2 -fPIC tools/gpu-worker/gpu-worker.cpp -o <build>/bin/llama-gpu-worker \
+//     -L<build>/bin -Wl,-rpath,$PWD/<build>/bin \
+//     -lllama -lllama-common -lggml-hip -lggml-cpu -lggml-base -lpthread -ldl
+//
+// One binary, three modes:
 //
 //   worker (child, owns the GPU):
 //     llama-gpu-worker --worker --uds /tmp/x.sock -m MODEL -c 4096 -ngl 99 [...]
 //     loads model+context (GPU per usual llama.cpp args), listens on a UNIX
 //     domain socket and serves: INIT, DECODE, DUMP_KV, RESTORE_KV, SHUTDOWN, PING
 //
-//   client (parent, GPU-free service side):
+//   server (the carrier: this binary's MAIN THREAD drives a real llama-server child):
+//     llama-gpu-worker --server -m MODEL [-ngl 99 -c 4096 ...server args...] \
+//                      [--prompt "..."] [--n-gen 16] [--n-resume 8] \
+//                      [--port N] [--server-bin PATH]
+//     The carrier (main thread) never loads a model and never touches a GPU.
+//     It fork+execs llama-server with an inherited socketpair fd (--kv-fd, no
+//     files anywhere) and is the KV-state "watchdog": the dumped KV blob lives
+//     in the carrier's own RAM as opaque bytes.
+//       1. control run: spawn(SKIP) -> prompt + (n_gen + n_resume) tokens
+//       2. sleep run:   spawn(SKIP) -> prompt + n_gen tokens -> DUMP -> blob
+//          in carrier RAM -> SIGKILL -> respawn(RESTORE blob) -> prompt +
+//          generated-so-far + n_resume more tokens
+//       3. greedy decoding is deterministic, so slept output must equal the
+//          control-run output exactly
+//     Inference over HTTP (/v1/completions); everything else passed through
+//     to the server verbatim. rocm-smi / nvidia-smi snapshots per phase.
+//
+//   client (parent, GPU-free service side) - the earlier raw-UDS PoC:
 //     llama-gpu-worker -m MODEL [--prompt "..."] [--n-gen 16] [--n-resume 8]
-//     never initializes a GPU (CPU model load, tokenization only);
-//     fork+execs the worker and validates the full Phase 2 lifecycle:
-//       1. control run: prompt + (n_gen + n_resume) tokens, never sleeps
-//       2. sleep run:   prompt + n_gen tokens -> DUMP_KV -> SIGKILL worker
-//          -> respawn worker -> RESTORE_KV -> n_resume more tokens
-//       3. greedy decoding is deterministic, so sleep-run output must equal
-//          the control-run output token-for-token
-//     Plus phased rocm-smi / nvidia-smi snapshots around each transition.
+//     fork+execs a --worker child over a UNIX domain socket (a file, unlike
+//     --server mode) with raw DECODE / DUMP_KV / RESTORE_KV. Kept as a direct
+//     KV-operation reference; prefer --server mode.
 
 #include "gpu-worker.h"
 
 #include "common.h"
 #include "arg.h"
 #include "log.h"
+#include "kv-socket.h"
 #include "llama.h"
+
+#include "json.hpp" // vendored nlohmann (carrier mode's HTTP responses only)
 
 #include <algorithm>
 #include <cerrno>
@@ -31,7 +55,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -39,6 +65,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 // ------------------------------------------------------------------ wire
 
@@ -604,10 +632,338 @@ static int run_client(int argc, char ** argv) {
     return (ok && same) ? 0 : 1;
 }
 
-int main(int argc, char ** argv) {
-    bool worker_mode = false;
-    for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--worker") { worker_mode = true; break; }
+// ------------------------------------------------------------------ server mode
+//
+// The carrier: this binary's main thread drives a real llama-server child.
+// No files anywhere - the KV channel is a socketpair whose child end is
+// inherited across fork+exec as fd GWP_KV_FD (--kv-fd). The KV blob is held
+// as opaque bytes in the carrier's RAM: dump -> RAM -> SIGKILL -> respawn ->
+// restore. The carrier never loads a model or touches a GPU.
+
+namespace {
+
+constexpr int GWP_KV_FD = 31;
+
+struct http_resp {
+    int status = 0;
+    std::string body;
+};
+
+static http_resp http_request(const std::string & host, int port, const std::string & path, const std::string & body) {
+    http_resp resp;
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return resp;
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(uint16_t(port));
+    addr.sin_addr.s_addr = inet_addr(host.c_str());
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) { ::close(fd); return resp; }
+    const std::string req = "POST " + path + " HTTP/1.1\r\n"
+                            "Host: " + host + ":" + std::to_string(port) + "\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                            "Connection: close\r\n\r\n" + body;
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(req.data());
+    size_t left = req.size();
+    while (left > 0) {
+        const ssize_t n = ::send(fd, p, left, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        p += n; left -= size_t(n);
     }
-    return worker_mode ? run_worker(argc, argv) : run_client(argc, argv);
+    char buf[8192];
+    std::string raw;
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw.append(buf, size_t(n));
+    }
+    ::close(fd);
+    const size_t sep = raw.find("\r\n\r\n");
+    if (sep == std::string::npos) return resp;
+    const size_t sp = raw.find(' ', 5);
+    resp.status = sp == std::string::npos ? 0 : std::atoi(raw.c_str() + sp + 1);
+    resp.body = raw.substr(sep + 4);
+    return resp;
+}
+
+// GET /v1/models until 200 (model load + boot handshake happen before listen)
+static bool wait_http_ready(int port, int timeout_s) {
+    const int64_t t0 = ggml_time_ms();
+    for (;;) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(uint16_t(port));
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0) {
+                const char * get = "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                (void) ::send(fd, get, strlen(get), MSG_NOSIGNAL);
+                char buf[512];
+                std::string raw;
+                for (;;) {
+                    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    raw.append(buf, size_t(n));
+                    if (raw.find("\r\n\r\n") != std::string::npos && raw.size() > 100) break;
+                }
+                ::close(fd);
+                // "HTTP/1.1 200 ..." - status starts at offset 9
+                if (raw.size() > 12 && raw.compare(9, 3, "200") == 0) return true;
+            } else {
+                ::close(fd);
+            }
+        }
+        if (ggml_time_ms() - t0 > timeout_s * 1000) return false;
+        usleep(500 * 1000);
+    }
+}
+
+static int pick_free_port() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in a {};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0) { ::close(fd); return -1; }
+    socklen_t len = sizeof(a);
+    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&a), &len) < 0) { ::close(fd); return -1; }
+    const int port = ntohs(a.sin_port);
+    ::close(fd);
+    return port;
+}
+
+// a forked llama-server child + the carrier end of its kv channel
+struct server_child {
+    pid_t pid = -1;
+    int kv_fd = -1; // carrier end of the socketpair (child end = GWP_KV_FD)
+    int port = 0;
+
+    // restore_blob = nullptr: fresh start (SKIP); otherwise sent as RESTORE
+    bool start(const std::string & bin, const std::vector<std::string> & args, int port_,
+               const std::vector<uint8_t> * restore_blob) {
+        port = port_;
+        int sv[2] = { -1, -1 };
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { perror("socketpair"); return false; }
+        pid = fork();
+        if (pid < 0) { perror("fork"); close(sv[0]); close(sv[1]); return false; }
+        if (pid == 0) {
+            // child: hand the socketpair end to the server as --kv-fd
+            close(sv[0]);
+            if (dup2(sv[1], GWP_KV_FD) != GWP_KV_FD) _exit(127);
+            if (sv[1] != GWP_KV_FD) close(sv[1]);
+            std::vector<std::string> storage;
+            storage.reserve(args.size() + 12); // argv holds .data() pointers - no reallocation
+            std::vector<char *> cargs;
+            auto push = [&](const std::string & s) { storage.push_back(s); cargs.push_back(storage.back().data()); };
+            push(bin);
+            for (const auto & a : args) push(a);
+            push("--host"); push("127.0.0.1");
+            push("--port"); push(std::to_string(port_));
+            push("--kv-fd"); push(std::to_string(GWP_KV_FD));
+            cargs.push_back(nullptr);
+            execv(bin.c_str(), cargs.data());
+            fprintf(stderr, "carrier: execv(%s) failed: %s\n", bin.c_str(), strerror(errno));
+            _exit(127);
+        }
+        close(sv[1]);
+        kv_fd = sv[0];
+
+        // boot handshake: server sends READY after model load, before listening
+        uint32_t op = 0;
+        std::vector<uint8_t> pl;
+        if (!kvsock::recv_frame(kv_fd, op, pl, 300 * 1000)) {
+            fprintf(stderr, "carrier: no READY from server (timeout)\n");
+            kill_hard();
+            return false;
+        }
+        if (op != kvsock::KV_OP_READY) {
+            fprintf(stderr, "carrier: expected READY, got op=%u\n", op);
+            kill_hard();
+            return false;
+        }
+        const bool ok = restore_blob && !restore_blob->empty()
+            ? kvsock::send_frame(kv_fd, kvsock::KV_OP_RESTORE, restore_blob->data(), restore_blob->size())
+            : kvsock::send_frame(kv_fd, kvsock::KV_OP_SKIP, nullptr, 0);
+        printf("carrier: %s (%.2f MiB) -> server pid %d\n",
+               restore_blob && !restore_blob->empty() ? "sent RESTORE" : "sent SKIP (fresh)",
+               restore_blob ? restore_blob->size() / 1048576.0 : 0.0, (int) pid);
+        if (!ok) { kill_hard(); return false; }
+        return true;
+    }
+
+    // POST /v1/completions (greedy, ignore_eos: exactly max_tokens tokens)
+    bool completion(const std::string & prompt, int max_tokens, std::string & out_text) {
+        nlohmann::json req = {
+            { "model", "test" },
+            { "prompt", prompt },
+            { "max_tokens", max_tokens },
+            { "temperature", 0 },
+            { "stream", false },
+            { "ignore_eos", true },
+        };
+        const http_resp r = http_request("127.0.0.1", port, "/v1/completions", req.dump());
+        if (r.status != 200) {
+            fprintf(stderr, "carrier: completion HTTP %d: %.300s\n", r.status, r.body.c_str());
+            return false;
+        }
+        try {
+            auto j = nlohmann::json::parse(r.body);
+            out_text = j["choices"][0]["text"].get<std::string>();
+            return true;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "carrier: completion JSON error: %s\n", e.what());
+            return false;
+        }
+    }
+
+    // request the full prompt-cache dump; the blob lands in the carrier's RAM
+    bool kv_dump(std::vector<uint8_t> & blob) {
+        if (!kvsock::send_frame(kv_fd, kvsock::KV_OP_DUMP, nullptr, 0)) return false;
+        uint32_t op = 0;
+        std::vector<uint8_t> rsp;
+        if (!kvsock::recv_frame(kv_fd, op, rsp, 0) || op != kvsock::KV_OP_DUMP_RSP || rsp.size() < 4) return false;
+        uint32_t ok = 0;
+        std::memcpy(&ok, rsp.data(), 4);
+        if (!ok) {
+            fprintf(stderr, "carrier: server rejected DUMP\n");
+            return false;
+        }
+        blob.assign(rsp.begin() + 4, rsp.end());
+        return true;
+    }
+
+    void kill_hard() {
+        if (pid > 0) {
+            ::kill(pid, SIGKILL);
+            int st;
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR);
+            printf("carrier: server pid %d SIGKILLed, reaped\n", (int) pid);
+            pid = -1;
+        }
+        if (kv_fd >= 0) { ::shutdown(kv_fd, SHUT_RDWR); ::close(kv_fd); kv_fd = -1; }
+    }
+
+    // graceful: SIGTERM, 10s, SIGKILL fallback
+    void stop() {
+        if (pid > 0) {
+            ::kill(pid, SIGTERM);
+            for (int i = 0; i < 100; i++) {
+                int st;
+                const pid_t r = waitpid(pid, &st, WNOHANG);
+                if (r == pid) { pid = -1; break; }
+                if (r < 0) break;
+                usleep(100 * 1000);
+            }
+            if (pid > 0) kill_hard();
+        }
+        if (kv_fd >= 0) { ::shutdown(kv_fd, SHUT_RDWR); ::close(kv_fd); kv_fd = -1; }
+    }
+};
+
+} // namespace
+
+static int run_server_mode(int argc, char ** argv) {
+    std::string prompt = "Explain in one sentence what a GPU is. Then list three typical uses.";
+    int n_gen = 16, n_resume = 8, port = 0;
+    std::string server_bin;
+    std::vector<std::string> srv_args; // everything the carrier doesn't consume
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--server")     { continue; }
+        if (a == "--prompt")     { prompt = argv[++i]; continue; }
+        if (a == "--n-gen")      { n_gen = atoi(argv[++i]); continue; }
+        if (a == "--n-resume")   { n_resume = atoi(argv[++i]); continue; }
+        if (a == "--port")       { port = atoi(argv[++i]); continue; }
+        if (a == "--server-bin") { server_bin = argv[++i]; continue; }
+        srv_args.push_back(a);
+    }
+    if (server_bin.empty()) {
+        // default: llama-server next to this binary
+        char exe[4096];
+        const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0 && strstr(exe, "llama-gpu-worker")) {
+            exe[n] = 0;
+            server_bin = std::string(exe, strlen(exe) - strlen("llama-gpu-worker")) + "llama-server";
+        }
+    }
+    if (server_bin.empty()) { fprintf(stderr, "carrier: no server binary (use --server-bin PATH)\n"); return 1; }
+    if (srv_args.empty())   { fprintf(stderr, "carrier: no server args (e.g. -m MODEL -ngl 99 -c 4096)\n"); return 1; }
+    if (port == 0) { port = pick_free_port(); if (port < 0) { perror("pick_free_port"); return 1; } }
+
+    printf("carrier pid=%d: %s (args: %zu passed through) port=%d n_gen=%d n_resume=%d\n",
+           (int) getpid(), server_bin.c_str(), srv_args.size(), port, n_gen, n_resume);
+
+    bool ok = true;
+    std::string control, s1, s2;
+    std::vector<uint8_t> blob; // the KV blob lives in the carrier's RAM, nowhere else
+
+    snapshot("PHASE 0: baseline (no server)");
+
+    // ---- run 1: control (never sleeps)
+    {
+        server_child sc;
+        ok = sc.start(server_bin, srv_args, port, nullptr);
+        if (ok && !wait_http_ready(port, 300)) { fprintf(stderr, "carrier: control server not ready\n"); ok = false; }
+        if (ok) ok = sc.completion(prompt, n_gen + n_resume, control);
+        if (ok) printf("carrier: control run done (%d tokens)\n", n_gen + n_resume);
+        sc.stop();
+    }
+
+    snapshot("PHASE 1: control server exited (expect: VRAM ~0)");
+
+    // ---- run 2: sleep/wake
+    {
+        server_child sc;
+        ok = ok && sc.start(server_bin, srv_args, port, nullptr);
+        if (ok && !wait_http_ready(port, 300)) { fprintf(stderr, "carrier: sleep-run server not ready\n"); ok = false; }
+        if (ok) ok = sc.completion(prompt, n_gen, s1);
+
+        snapshot("PHASE 1b: server alive (expect: server pid listed, VRAM up)");
+
+        if (ok) {
+            // let the slot go idle and publish its state to the prompt cache
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            if (sc.kv_dump(blob)) printf("carrier: KV blob in RAM: %.2f MiB\n", blob.size() / 1048576.0);
+            else ok = false;
+        }
+
+        sc.kill_hard();
+
+        snapshot("PHASE 2: server dropped (expect: no server pid, VRAM ~0)");
+
+        // wake: respawn + RESTORE, then continue from where the sleep left off
+        server_child wc;
+        ok = ok && wc.start(server_bin, srv_args, port, blob.empty() ? nullptr : &blob);
+        if (ok && !wait_http_ready(port, 300)) { fprintf(stderr, "carrier: wake server not ready\n"); ok = false; }
+        if (ok) ok = wc.completion(prompt + s1, n_resume, s2);
+
+        snapshot("PHASE 3: server respawned + KV restored (expect: VRAM up)");
+
+        wc.stop();
+    }
+
+    snapshot("PHASE 4: all servers exited (expect: VRAM ~0)");
+
+    const std::string slept = s1 + s2;
+    const bool same = slept == control;
+    printf("\n================ SUMMARY ================\n");
+    printf("control (%d tok) : %s\n", n_gen + n_resume, control.c_str());
+    printf("slept   (%zu tok) : %s\n", slept.size(), slept.c_str());
+    printf("KV blob         : %.2f MiB (carrier RAM only, no files)\n", blob.size() / 1048576.0);
+    printf("continuity (slept == control): %s\n", (same && ok) ? "PASS" : "FAIL");
+    return (ok && same) ? 0 : 1;
+}
+
+int main(int argc, char ** argv) {
+    bool worker_mode = false, server_mode = false;
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--worker") { worker_mode = true; break; }
+        if (a == "--server") { server_mode = true; break; }
+    }
+    if (worker_mode) return run_worker(argc, argv);
+    if (server_mode) return run_server_mode(argc, argv);
+    return run_client(argc, argv);
 }
