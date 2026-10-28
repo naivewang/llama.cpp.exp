@@ -10,6 +10,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-kv-socket.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1040,6 +1041,7 @@ public:
     }
 
     ~server_context_impl() {
+        kv_shutdown();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1097,6 +1099,13 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // KV handoff channel to a GPU-free parent (watchdog), see server-kv-socket.h.
+    // The parent holds dumped KV states in its own RAM (no files): deep-sleep =
+    // dump -> parent -> kill this process; wake = new process + restore.
+    int          kv_fd     = -1;   // from --kv-fd; connected socket to the watchdog
+    std::mutex   kv_mutex;         // guards prompt_cache->states vs the kv control thread
+    std::thread  kv_thread;        // kv control channel thread (DUMP/PING)
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1134,6 +1143,42 @@ private:
         mctx = nullptr;
     }
 
+    // release the process-local GPU context(s) of the used devices so the hardware can power
+    // down fully while the server is sleeping.
+    // note: safe only after destroy(), when this process holds no model/context on those devices
+    //       (additional models of a multi-model server run in separate processes)
+    void release_gpu_contexts() {
+        std::vector<ggml_backend_dev_t> devs;
+        if (!params_base.devices.empty()) {
+            devs = params_base.devices;
+        } else {
+            // no explicit -dev list (e.g. plain -ngl): release all GPU-type devices of the system
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    devs.push_back(dev);
+                }
+            }
+        }
+        for (ggml_backend_dev_t dev : devs) {
+            if (!dev) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            if (!reg) {
+                continue;
+            }
+            auto release = (ggml_backend_dev_release_context_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_release_context");
+            if (!release) {
+                continue;
+            }
+            if (!release(dev)) {
+                SRV_WRN("sleep: failed to release GPU context of device '%s'\n", ggml_backend_dev_name(dev));
+            }
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1142,7 +1187,28 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
-            destroy();
+            // swap out the live KV of all non-empty slots into the RAM prompt cache
+            // (same prompt_save() path as a normal slot swap) so sessions can be
+            // restored after wake without a full re-prefill
+            if (prompt_cache) {
+                SRV_INF("%s", "sleep: saving slot state to RAM prompt cache\n");
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                for (server_slot & slot : slots) {
+                    slot.prompt_save(*prompt_cache);
+                }
+                prompt_cache->update();
+            }
+            {
+                const int64_t t0 = ggml_time_ms();
+                destroy();
+                SRV_INF("sleep: destroyed model/contexts in %.1f s\n", (ggml_time_ms() - t0) / 1000.0);
+            }
+            if (params_base.sleep_release_gpu) {
+                SRV_INF("%s", "sleep: releasing GPU contexts (may take a moment)\n");
+                const int64_t t0 = ggml_time_ms();
+                release_gpu_contexts();
+                SRV_INF("sleep: GPU context release done in %.1f s\n", (ggml_time_ms() - t0) / 1000.0);
+            }
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -1585,9 +1651,15 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // on resume from sleep the model and params are identical, so the RAM prompt cache
+            // (raw state blobs, context-independent) is still valid: keep it instead of
+            // recreating; only the VRAM copy is rebuilt on cache hit
+            if (!(prompt_cache && is_resume)) {
+                prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            prompt_cache.reset();
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1615,6 +1687,15 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        // KV handoff channel to a GPU-free parent (watchdog): boot handshake
+        // (RESTORE/SKIP) before serving starts, then a control thread for
+        // runtime DUMP requests. See server-kv-socket.h.
+        if (!is_resume && params.kv_fd >= 0) {
+            kv_fd = params.kv_fd;
+            kv_boot_handshake();
+            kv_thread = std::thread([this] { kv_control_loop(); });
+        }
+
         if (!is_resume) {
             return init();
         }
@@ -1624,6 +1705,134 @@ private:
         }
 
         return true;
+    }
+
+    // close the KV control channel and join its thread (idempotent); the join
+    // is skipped when called from the kv thread itself (shutdown request)
+    void kv_shutdown() {
+        if (kv_fd >= 0) {
+            ::shutdown(kv_fd, SHUT_RDWR);
+            ::close(kv_fd);
+            kv_fd = -1;
+        }
+        if (kv_thread.joinable() && std::this_thread::get_id() != kv_thread.get_id()) {
+            kv_thread.join();
+        }
+    }
+
+    // boot handshake: READY -> RESTORE/SKIP; the restored states are inserted
+    // into the prompt cache so a matching request gets a full cache hit
+    // (KV restored, no re-prefill) before serving starts
+    void kv_boot_handshake() {
+        if (!kvsock::send_frame(kv_fd, kvsock::KV_OP_READY, nullptr, 0)) {
+            SRV_WRN("%s", "kv: failed to send READY to parent, disabling kv channel\n");
+            kv_fd = -1;
+            return;
+        }
+        uint32_t op = 0;
+        std::vector<uint8_t> payload;
+        if (!kvsock::recv_frame(kv_fd, op, payload, 300000)) {
+            SRV_WRN("%s", "kv: no RESTORE/SKIP from parent in time, continuing without restore\n");
+            return; // keep the channel open for runtime DUMP
+        }
+        if (op == kvsock::KV_OP_SKIP || (op == kvsock::KV_OP_RESTORE && payload.empty())) {
+            SRV_INF("%s", "kv: parent sent SKIP (fresh start)\n");
+            return;
+        }
+        if (op != kvsock::KV_OP_RESTORE) {
+            SRV_WRN("kv: unexpected boot frame op=%u, ignoring\n", op);
+            return;
+        }
+        if (!prompt_cache) {
+            SRV_ERR("%s", "kv: got RESTORE but the prompt cache is disabled (--cache-ram 0?)\n");
+            return;
+        }
+        std::list<server_prompt_cache_state> states;
+        if (!kvsock::deserialize_states(payload.data(), payload.size(), states)) {
+            SRV_ERR("kv: failed to deserialize restored states (%zu bytes)\n", payload.size());
+            return;
+        }
+        size_t n_tokens = 0, n_bytes = 0;
+        for (auto & st : states) {
+            n_tokens += st.prompt.n_tokens();
+            n_bytes  += st.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(kv_mutex);
+            for (auto & st : states) {
+                prompt_cache->states.push_back(std::move(st));
+            }
+        }
+        SRV_INF("kv: restored %zu prompt-cache state(s), %d tokens, %.3f MiB (matching request gets a full cache hit)\n",
+                states.size(), (int) n_tokens, n_bytes / (1024.0*1024.0));
+    }
+
+    // runtime control channel: DUMP (serialize the prompt cache, force-saving
+    // idle slots first - their state is normally only published on the next
+    // task) and PING
+    void kv_control_loop() {
+        bool parent_shutdown = false;
+        for (;;) {
+            uint32_t op = 0;
+            std::vector<uint8_t> payload;
+            if (!kvsock::recv_frame(kv_fd, op, payload, 0)) {
+                break; // parent went away or the channel was closed
+            }
+            switch (op) {
+                case kvsock::KV_OP_DUMP: {
+                    std::vector<uint8_t> out;
+                    {
+                        std::lock_guard<std::mutex> lock(kv_mutex);
+                        if (prompt_cache && !sleeping) {
+                            for (auto & slot : slots) {
+                                if (slot.state == SLOT_STATE_IDLE && slot.ctx_tgt && !slot.prompt.tokens.empty()) {
+                                    slot.prompt_save(*prompt_cache);
+                                }
+                            }
+                            prompt_cache->update();
+                            std::vector<uint8_t> states_data;
+                            kvsock::serialize_states(prompt_cache->states, states_data);
+                            out.resize(4);
+                            uint32_t ok = 1;
+                            std::memcpy(out.data(), &ok, 4);
+                            out.insert(out.end(), states_data.begin(), states_data.end());
+                        } else {
+                            out.resize(4, 0); // ok = 0
+                        }
+                    }
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_DUMP_RSP, out.data(), out.size());
+                    break;
+                }
+                case kvsock::KV_OP_PING: {
+                    uint32_t ok = 1;
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_PONG, (const uint8_t *) &ok, 4);
+                    break;
+                }
+                case kvsock::KV_OP_SHUTDOWN: {
+                    // the KV is already in the parent's RAM (DUMP); nothing left
+                    // to save - acknowledge first, then exit gracefully
+                    uint32_t ok = 1;
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_SHUTDOWN_RSP, (const uint8_t *) &ok, 4);
+                    SRV_INF("%s", "kv: parent requested shutdown, exiting gracefully\n");
+                    parent_shutdown = true;
+                    break;
+                }
+                default:
+                    SRV_WRN("kv: unexpected frame op=%u\n", op);
+                    break;
+            }
+            if (parent_shutdown) {
+                break;
+            }
+        }
+        SRV_INF("%s", "kv: control channel closed\n");
+        if (parent_shutdown) {
+            // same unblock as the SIGINT path (shutdown_handler ->
+            // server_context::terminate()), minus kv_shutdown() which would
+            // self-join this thread; main's clean_up() then does the rest
+            // (HTTP stop, llama_backend_free -> GPU released, exit 0)
+            queue_tasks.terminate();
+        }
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1867,13 +2076,17 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                {
+                    std::lock_guard<std::mutex> lock(kv_mutex);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                    ret->prompt_save(*prompt_cache);
+
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear();
+                    }
+
+                    prompt_cache->update();
                 }
-
-                prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2647,8 +2860,11 @@ private:
         GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
         for (auto * slot : child_slots) {
             // keep the state that the child task is about to overwrite
-            if (prompt_cache && slot->prompt_save(*prompt_cache)) {
-                prompt_cache->update();
+            {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                if (prompt_cache && slot->prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
             }
 
             int id_child = parent_task.child_tasks[idx].id;
@@ -3017,9 +3233,12 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
+                                {
+                                    std::lock_guard<std::mutex> lock(kv_mutex);
+                                    if (slot.prompt_save(*prompt_cache)) {
+                                        SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                        prompt_cache->update();
+                                    }
                                 }
 
                                 if (params_base.kv_unified) {
@@ -5098,6 +5317,7 @@ void server_context::start_loop() {
 }
 
 void server_context::terminate() {
+    impl->kv_shutdown();
     impl->queue_tasks.terminate();
 }
 

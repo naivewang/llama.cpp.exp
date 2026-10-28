@@ -643,6 +643,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    int32_t kv_fd               = -1;    // --kv-fd: connected socket to a GPU-free parent (watchdog) for KV handoff; -1 = disabled
 
     // llama-connect params
     bool        server_connect      = false;
@@ -667,6 +668,7 @@ struct common_params {
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+    bool sleep_release_gpu = false; // on sleep, release the GPU context of the used devices so the GPU can power down fully
 
     std::vector<std::string> api_keys;
 
