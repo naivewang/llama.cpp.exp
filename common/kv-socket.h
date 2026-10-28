@@ -36,6 +36,11 @@ constexpr uint32_t KV_OP_DUMP_RSP  = 5; // server -> carrier: u32 ok (1=ok, 0=fa
                                         // states (empty on failure)
 constexpr uint32_t KV_OP_PING      = 6; // either direction
 constexpr uint32_t KV_OP_PONG      = 7; // reply: u32 ok
+constexpr uint32_t KV_OP_SHUTDOWN    = 8; // carrier -> server: exit gracefully now (the KV was
+                                          // already dumped to the carrier); the server replies
+                                          // first, then runs its normal SIGINT teardown (releases
+                                          // the GPU itself) and exits 0
+constexpr uint32_t KV_OP_SHUTDOWN_RSP = 9; // server -> carrier: u32 ok
 
 constexpr uint32_t HDR_LEN = 8;
 constexpr size_t   MAX_FRAME = 64ull << 30; // 64 GiB sanity cap

@@ -26,8 +26,10 @@
 //     in the carrier's own RAM as opaque bytes.
 //       1. control run: spawn(SKIP) -> prompt + (n_gen + n_resume) tokens
 //       2. sleep run:   spawn(SKIP) -> prompt + n_gen tokens -> DUMP -> blob
-//          in carrier RAM -> SIGKILL -> respawn(RESTORE blob) -> prompt +
-//          generated-so-far + n_resume more tokens
+//          in carrier RAM -> SHUTDOWN over the kv channel ("inform and exit":
+//          the server releases the GPU itself and exits 0; SIGKILL is only a
+//          fallback) -> respawn(RESTORE blob) -> prompt + generated-so-far +
+//          n_resume more tokens
 //       3. greedy decoding is deterministic, so slept output must equal the
 //          control-run output exactly
 //     Inference over HTTP (/v1/completions); everything else passed through
@@ -845,6 +847,55 @@ struct server_child {
         if (kv_fd >= 0) { ::shutdown(kv_fd, SHUT_RDWR); ::close(kv_fd); kv_fd = -1; }
     }
 
+    // graceful "inform and exit" over the kv channel: the server acks, then
+    // runs its normal SIGINT teardown (releases the GPU itself) and exits 0.
+    // Returns true if the ack was received.
+    bool request_exit() {
+        if (kv_fd < 0) {
+            return false;
+        }
+        if (!kvsock::send_frame(kv_fd, kvsock::KV_OP_SHUTDOWN, nullptr, 0)) {
+            return false;
+        }
+        uint32_t op = 0;
+        std::vector<uint8_t> rsp;
+        if (kvsock::recv_frame(kv_fd, op, rsp, 10 * 1000) && op == kvsock::KV_OP_SHUTDOWN_RSP) {
+            printf("carrier: server acked SHUTDOWN (it now exits gracefully on its own)\n");
+            return true;
+        }
+        fprintf(stderr, "carrier: no SHUTDOWN ack from server\n");
+        return false;
+    }
+
+    // wait for the (informed) server to exit; SIGKILL fallback if it hangs
+    void stop_graceful(int timeout_s = 120) {
+        request_exit();
+        if (pid > 0) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (;;) {
+                int st = 0;
+                const pid_t r = waitpid(pid, &st, WNOHANG);
+                if (r == pid) {
+                    printf("carrier: server pid %d exited (status %d)\n", (int) pid, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+                    pid = -1;
+                    break;
+                }
+                if (r < 0) {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(timeout_s)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (pid > 0) {
+                fprintf(stderr, "carrier: server did not exit in %d s, SIGKILL fallback\n", timeout_s);
+                kill_hard();
+            }
+        }
+        if (kv_fd >= 0) { ::shutdown(kv_fd, SHUT_RDWR); ::close(kv_fd); kv_fd = -1; }
+    }
+
     // graceful: SIGTERM, 10s, SIGKILL fallback
     void stop() {
         if (pid > 0) {
@@ -929,12 +980,15 @@ static int run_server_mode(int argc, char ** argv) {
             else ok = false;
         }
 
-        sc.kill_hard();
-        // the ROCm/CUDA driver reclaims a killed process's VRAM asynchronously;
-        // give it a moment so the snapshot below shows the real (released) state
+        // "inform and exit": the KV is already in our RAM, so ask the server
+        // to shut down over the kv channel - it releases the GPU itself and
+        // exits 0 (SIGKILL is only a fallback for a hung server)
+        sc.stop_graceful();
+        // VRAM release can still lag the process exit a moment;
+        // give it time so the snapshot below shows the real state
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
-        snapshot("PHASE 2: server dropped (expect: no server pid, VRAM ~0)");
+        snapshot("PHASE 2: server exited (expect: no server pid, VRAM ~0)");
 
         // wake: respawn + RESTORE, then continue from where the sleep left off
         server_child wc;

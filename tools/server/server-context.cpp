@@ -1707,14 +1707,15 @@ private:
         return true;
     }
 
-    // close the KV control channel and join its thread (idempotent)
+    // close the KV control channel and join its thread (idempotent); the join
+    // is skipped when called from the kv thread itself (shutdown request)
     void kv_shutdown() {
         if (kv_fd >= 0) {
             ::shutdown(kv_fd, SHUT_RDWR);
             ::close(kv_fd);
             kv_fd = -1;
         }
-        if (kv_thread.joinable()) {
+        if (kv_thread.joinable() && std::this_thread::get_id() != kv_thread.get_id()) {
             kv_thread.join();
         }
     }
@@ -1770,6 +1771,7 @@ private:
     // idle slots first - their state is normally only published on the next
     // task) and PING
     void kv_control_loop() {
+        bool parent_shutdown = false;
         for (;;) {
             uint32_t op = 0;
             std::vector<uint8_t> payload;
@@ -1806,12 +1808,31 @@ private:
                     kvsock::send_frame(kv_fd, kvsock::KV_OP_PONG, (const uint8_t *) &ok, 4);
                     break;
                 }
+                case kvsock::KV_OP_SHUTDOWN: {
+                    // the KV is already in the parent's RAM (DUMP); nothing left
+                    // to save - acknowledge first, then exit gracefully
+                    uint32_t ok = 1;
+                    kvsock::send_frame(kv_fd, kvsock::KV_OP_SHUTDOWN_RSP, (const uint8_t *) &ok, 4);
+                    SRV_INF("%s", "kv: parent requested shutdown, exiting gracefully\n");
+                    parent_shutdown = true;
+                    break;
+                }
                 default:
                     SRV_WRN("kv: unexpected frame op=%u\n", op);
                     break;
             }
+            if (parent_shutdown) {
+                break;
+            }
         }
         SRV_INF("%s", "kv: control channel closed\n");
+        if (parent_shutdown) {
+            // same unblock as the SIGINT path (shutdown_handler ->
+            // server_context::terminate()), minus kv_shutdown() which would
+            // self-join this thread; main's clean_up() then does the rest
+            // (HTTP stop, llama_backend_free -> GPU released, exit 0)
+            queue_tasks.terminate();
+        }
     }
 
     // unlike load_model(), this is only called once during initialization
